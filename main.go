@@ -3,91 +3,206 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
 
 type Item struct {
-	ID   string `json:"id"` //marker for json so that our encoders and decoders recognize which attr is which in json and struct
-	Name string `json:"name"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 type Store struct {
-	mu    sync.RWMutex //apparently we need the Mutex in case multiple users are doing operations together so the data does not get changed/corrupted
-	items map[string]Item
+	mu      sync.RWMutex
+	items   map[string]Item
+	walFile *os.File
 }
 
-var store = Store{
-	items: make(map[string]Item),
+type WAL struct {
+	Operation string
+	Key       string
+	Value     string
+	Timestamp time.Time
+}
+
+var store Store
+
+func (s *Store) getAll() []Item {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []Item
+	for _, item := range s.items {
+		result = append(result, item)
+	}
+	return result
+}
+
+func (s *Store) getItem(key string) (Item, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	item, exists := s.items[key]
+	if !exists {
+		return Item{}, false
+	}
+	return item, true
+}
+
+func (s *Store) putItem(item *Item, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op := WAL{
+		Operation: "PUT",
+		Key:       key,
+		Value:     item.Value,
+		Timestamp: time.Now(),
+	}
+
+	err := s.appendWAL(op)
+	if err != nil {
+		return err
+	}
+	item.Key = key
+	s.items[key] = *item
+	return nil
+}
+
+func (s *Store) deleteItem(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, exists := s.items[key]
+	if !exists {
+		return false
+	}
+	op := WAL{
+		Operation: "DELETE",
+		Key:       key,
+		Timestamp: time.Now(),
+	}
+	err := s.appendWAL(op)
+	if err != nil {
+		return false
+	}
+	delete(s.items, key)
+	return true
+}
+
+func (s *Store) appendWAL(op WAL) error {
+	jsonBytes, err := json.Marshal(op)
+	if err != nil {
+		return err
+	}
+	_, err = s.walFile.Write(append(jsonBytes, '\n'))
+	if err != nil {
+		return err
+	}
+	err = s.walFile.Sync()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) loadWAL() error {
+	_, err := s.walFile.Seek(0, 0)
+	if err != nil {
+		return err
+	}
+
+	decoder := json.NewDecoder(s.walFile)
+
+	for {
+		var op WAL
+		err := decoder.Decode(&op)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		switch op.Operation {
+		case "PUT":
+			s.items[op.Key] = Item{
+				Key:   op.Key,
+				Value: op.Value,
+			}
+		case "DELETE":
+			delete(s.items, op.Key)
+		}
+	}
+	return nil
 }
 
 func main() {
+	wal, err := os.OpenFile(
+		"wal.log",
+		os.O_CREATE|os.O_APPEND|os.O_RDWR,
+		0644,
+	)
+	if err != nil {
+		panic(err)
+	}
+	store = Store{
+		items:   make(map[string]Item),
+		walFile: wal,
+	}
+	err = store.loadWAL()
+	if err != nil {
+		panic(err)
+	}
 	r := chi.NewRouter()
 	r.Get("/items", getAllItems)
-	r.Get("/items/{id}", getItem)
-	r.Put("/items/{id}", putItem)
-	r.Delete("/items/{id}", deleteItem)
-	fmt.Println("Server is running on port 8080 ")
-	http.ListenAndServe(":8080", r)
+	r.Get("/items/{key}", getItem)
+	r.Put("/items/{key}", putItem)
+	r.Delete("/items/{key}", deleteItem)
+	fmt.Println("Server is running on port 8080")
+	defer wal.Close()
+	err = http.ListenAndServe(":8080", r)
 }
 
 func getAllItems(w http.ResponseWriter, r *http.Request) {
-	//w is response stream, r is incoming stream. They are passed as arguments here
-	//http.Request is a pointer as the Request object is large apparently and better to store the start memory location of it so yeah
 	w.Header().Set("Content-Type", "application/json")
-	store.mu.RLock()
-	defer store.mu.RUnlock() //concurrency control wow (DBMS)
-	var result []Item
-	for _, item := range store.items {
-		result = append(result, item)
-	}
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(store.getAll())
 }
 
 func getItem(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	store.mu.RLock()
-	defer store.mu.RUnlock()
-	item, exists := store.items[id]
+	key := chi.URLParam(r, "key")
+	item, exists := store.getItem(key)
 	if !exists {
 		http.Error(w, "item not found", http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(item)
-
-	//Encoder is reading a struct and then converting it to a json object so it can be written to the response stream. it is "encoding" the item basically
 }
 
 func putItem(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+	key := chi.URLParam(r, "key")
 	var item Item
 	err := json.NewDecoder(r.Body).Decode(&item)
-	//Decoder takes the incoming stream which is bytes, decodes it to a json object, and then decodes it to a go struct based on the markers we have given it.
-	//we pass it by reference because the item is initially empty in memory and then modified based on the decoding
 	if err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	item.ID = id
-	store.mu.Lock()
-	store.items[id] = item
-	store.mu.Unlock()
+	newerr := store.putItem(&item, key)
+	if newerr != nil {
+		http.Error(w, "storage failure", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(item)
 }
 
 func deleteItem(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	_, exists := store.items[id]
+	key := chi.URLParam(r, "key")
+	exists := store.deleteItem(key)
 	if !exists {
 		http.Error(w, "item not found", http.StatusNotFound)
 		return
 	}
-	delete(store.items, id)
 	w.Write([]byte("deleted"))
 }
