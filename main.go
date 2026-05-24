@@ -12,131 +12,287 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-type Item struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
+type Table struct {
+	Name    string         `json:"name"`
+	Columns []Column       `json:"columns,omitempty"`
+	Rows    map[string]Row `json:"rows,omitempty"`
 }
+type Column struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+type Row map[string]interface{}
 
 type WAL struct {
-	OpNumber  int       `json:"opNumber"`
-	Operation string    `json:"operation"`
-	Key       string    `json:"key"`
-	Value     string    `json:"value"`
-	Timestamp time.Time `json:"timestamp"`
+	OpNumber  int                    `json:"opNumber"`
+	Operation string                 `json:"operation"`
+	TableName string                 `json:"tableName"`
+	RowID     string                 `json:"rowId,omitempty"`
+	RowData   map[string]interface{} `json:"rowData,omitempty"`
+	Columns   []Column               `json:"columns,omitempty"`
+	Timestamp time.Time              `json:"timestamp"`
 }
 
 type Snapshot struct {
-	LastOpNumber int             `json:"lastOpNumber"`
-	Items        map[string]Item `json:"items"`
+	LastOpNumber int               `json:"lastOpNumber"`
+	Items        map[string]*Table `json:"items"`
 }
 
-type Store struct {
+type Database struct {
 	mu           sync.RWMutex
-	items        map[string]Item
+	tables       map[string]*Table
 	walFile      *os.File
 	lastOpNumber int
+	snapshotChan chan struct{}
+}
+type CreateTableRequest struct {
+	Columns []Column `json:"columns"`
 }
 
-var store Store
+var db Database
 
-func (s *Store) getAll() []Item {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	result := make([]Item, 0, len(s.items))
+func validType(t string) bool {
+	switch t {
+	case "string", "int", "bool":
+		return true
+	default:
+		return false
+	}
+}
 
-	for _, item := range s.items {
-		result = append(result, item)
+func (db *Database) createTable(name string, columns []Column) (*Table, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, exists := db.tables[name]
+	if exists {
+		return nil, fmt.Errorf("table already exists")
+	}
+	columnNames := make(map[string]bool)
+	for _, c := range columns {
+		if c.Name == "" {
+			return nil, fmt.Errorf("column name cannot be empty")
+		}
+		if !validType(c.Type) {
+			return nil, fmt.Errorf("unsupported type: %s", c.Type)
+		}
+		if columnNames[c.Name] {
+			return nil, fmt.Errorf("duplicate column: %s", c.Name)
+		}
+		columnNames[c.Name] = true
+	}
+
+	op := WAL{
+		OpNumber:  db.lastOpNumber + 1,
+		Operation: "CREATE_TABLE",
+		TableName: name,
+		Columns:   columns,
+		Timestamp: time.Now(),
+	}
+	err := db.appendWAL(op)
+	if err != nil {
+		return nil, err
+	}
+	table := &Table{
+		Name:    name,
+		Columns: columns,
+		Rows:    make(map[string]Row),
+	}
+	db.tables[name] = table
+	db.lastOpNumber = op.OpNumber
+	if db.lastOpNumber%10 == 0 {
+		select {
+		case db.snapshotChan <- struct{}{}:
+		default:
+		}
+	}
+	return table, nil
+}
+
+func (db *Database) insertRow(tableName string, rowID string, row Row) (Row, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	table, exists := db.tables[tableName]
+	if !exists {
+		return nil, fmt.Errorf("table does not exist")
+	}
+	_, exists = table.Rows[rowID]
+	if exists {
+		return nil, fmt.Errorf("row already exists")
+	}
+	for _, column := range table.Columns {
+		value, exists := row[column.Name]
+		if !exists {
+			return nil, fmt.Errorf("missing column: %s", column.Name)
+		}
+		switch column.Type {
+
+		case "string":
+			_, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("column %s must be string", column.Name)
+			}
+
+		case "int":
+			number, ok := value.(float64)
+			if !ok {
+				return nil, fmt.Errorf("column %s must be int", column.Name)
+			}
+
+			if number != float64(int(number)) {
+				return nil, fmt.Errorf("column %s must be integer", column.Name)
+			}
+
+		case "bool":
+			_, ok := value.(bool)
+			if !ok {
+				return nil, fmt.Errorf("column %s must be bool", column.Name)
+			}
+		}
+	}
+
+	for key := range row {
+		found := false
+		for _, column := range table.Columns {
+			if column.Name == key {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("unknown column: %s", key)
+		}
+	}
+	op := WAL{
+		OpNumber:  db.lastOpNumber + 1,
+		Operation: "INSERT_ROW",
+		TableName: tableName,
+		RowID:     rowID,
+		RowData:   row,
+		Timestamp: time.Now(),
+	}
+	err := db.appendWAL(op)
+	if err != nil {
+		return nil, err
+	}
+	table.Rows[rowID] = row
+	db.lastOpNumber = op.OpNumber
+	if db.lastOpNumber%10 == 0 {
+		select {
+		case db.snapshotChan <- struct{}{}:
+		default:
+		}
+	}
+	return row, nil
+}
+
+func (db *Database) deleteTable(name string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, exists := db.tables[name]
+	if !exists {
+		return fmt.Errorf("table does not exist")
+	}
+	op := WAL{
+		OpNumber:  db.lastOpNumber + 1,
+		Operation: "DELETE_TABLE",
+		TableName: name,
+		Timestamp: time.Now(),
+	}
+	err := db.appendWAL(op)
+	if err != nil {
+		return err
+	}
+	delete(db.tables, name)
+	db.lastOpNumber = op.OpNumber
+	return nil
+}
+
+func (db *Database) deleteRow(tableName, rowId string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	table, exists := db.tables[tableName]
+	if !exists {
+		return fmt.Errorf("table does not exist")
+	}
+	_, exists = table.Rows[rowId]
+	if !exists {
+		return fmt.Errorf("row does not exist")
+	}
+	op := WAL{
+		OpNumber:  db.lastOpNumber + 1,
+		Operation: "DELETE_ROW",
+		TableName: tableName,
+		RowID:     rowId,
+		Timestamp: time.Now(),
+	}
+	err := db.appendWAL(op)
+	if err != nil {
+		return err
+	}
+	delete(table.Rows, rowId)
+	db.lastOpNumber = op.OpNumber
+	return nil
+}
+
+func (db *Database) getTables() []Table {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var result []Table
+	for _, table := range db.tables {
+		result = append(result, *table)
 	}
 	return result
 }
 
-func (s *Store) getItem(key string) (Item, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	item, exists := s.items[key]
-	return item, exists
+func (db *Database) getTable(tableName string) (*Table, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	table, ok := db.tables[tableName]
+	if !ok {
+		return nil, fmt.Errorf("table does not exist")
+	}
+	return table, nil
 }
 
-func (s *Store) putItem(item *Item, key string) error {
-	op := WAL{
-		OpNumber:  s.lastOpNumber + 1,
-		Operation: "PUT",
-		Key:       key,
-		Value:     item.Value,
-		Timestamp: time.Now(),
+func (db *Database) getRow(tableName, rowId string) (Row, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	table, ok := db.tables[tableName]
+	if !ok {
+		return nil, fmt.Errorf("table does not exist")
 	}
-	err := s.appendWAL(op)
-	if err != nil {
-		return err
+	row, ok := table.Rows[rowId]
+	if !ok {
+		return nil, fmt.Errorf("row does not exist")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	item.Key = key
-	s.items[key] = *item
-	s.lastOpNumber = op.OpNumber
-	if s.lastOpNumber%10 == 0 {
-		err = s.createSnapshot()
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return row, nil
 }
 
-func (s *Store) deleteItem(key string) (bool, error) {
-	s.mu.RLock()
-	_, exists := s.items[key]
-	s.mu.RUnlock()
-	if !exists {
-		return false, nil
-	}
-	op := WAL{
-		OpNumber:  s.lastOpNumber + 1,
-		Operation: "DELETE",
-		Key:       key,
-		Timestamp: time.Now(),
-	}
-	err := s.appendWAL(op)
-	if err != nil {
-		return false, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.items, key)
-	s.lastOpNumber = op.OpNumber
-	if s.lastOpNumber%10 == 0 {
-		err = s.createSnapshot()
-		if err != nil {
-			return false, err
-		}
-	}
-	return true, nil
-}
-
-func (s *Store) appendWAL(op WAL) error {
+func (db *Database) appendWAL(op WAL) error {
 	bytes, err := json.Marshal(op)
 	if err != nil {
 		return err
 	}
-	_, err = s.walFile.Write(append(bytes, '\n'))
+	_, err = db.walFile.Write(append(bytes, '\n'))
 	if err != nil {
 		return err
 	}
-	return s.walFile.Sync()
+	return db.walFile.Sync()
 }
 
-func (s *Store) createSnapshot() error {
+func (db *Database) createSnapshot() error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	file, err := os.Create("snapshot.json")
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	snap := Snapshot{
-		LastOpNumber: s.lastOpNumber,
-		Items:        s.items,
+		LastOpNumber: db.lastOpNumber,
+		Items:        db.tables,
 	}
-	encoder := json.NewEncoder(file)
-	err = encoder.Encode(snap)
+	err = json.NewEncoder(file).Encode(snap)
 	if err != nil {
 		return err
 	}
@@ -144,22 +300,20 @@ func (s *Store) createSnapshot() error {
 	if err != nil {
 		return err
 	}
-	s.walFile.Close()
-	os.Create("wal.log")
+	db.walFile.Close()
 	wal, err := os.OpenFile(
 		"wal.log",
-		os.O_CREATE|os.O_RDWR|os.O_APPEND,
+		os.O_CREATE|os.O_RDWR|os.O_TRUNC,
 		0644,
 	)
 	if err != nil {
 		return err
 	}
-	s.walFile = wal
-	_, err = s.walFile.Seek(0, 0)
-	return err
+	db.walFile = wal
+	return nil
 }
 
-func (s *Store) loadSnapshot() error {
+func (db *Database) loadSnapshot() error {
 	_, err := os.Stat("snapshot.json")
 	if os.IsNotExist(err) {
 		return nil
@@ -174,17 +328,23 @@ func (s *Store) loadSnapshot() error {
 	if err != nil {
 		return err
 	}
-	s.items = snap.Items
-	s.lastOpNumber = snap.LastOpNumber
+	if snap.Items == nil {
+		db.tables = make(map[string]*Table)
+	} else {
+		db.tables = snap.Items
+	}
+
+	db.lastOpNumber = snap.LastOpNumber
+
 	return nil
 }
 
-func (s *Store) loadWAL() error {
-	_, err := s.walFile.Seek(0, 0)
+func (db *Database) loadWAL() error {
+	_, err := db.walFile.Seek(0, 0)
 	if err != nil {
 		return err
 	}
-	decoder := json.NewDecoder(s.walFile)
+	decoder := json.NewDecoder(db.walFile)
 	for {
 		var op WAL
 		err := decoder.Decode(&op)
@@ -194,21 +354,47 @@ func (s *Store) loadWAL() error {
 		if err != nil {
 			return err
 		}
-		if op.OpNumber <= s.lastOpNumber {
+		if op.OpNumber <= db.lastOpNumber {
 			continue
 		}
 		switch op.Operation {
-		case "PUT":
-			s.items[op.Key] = Item{
-				Key:   op.Key,
-				Value: op.Value,
+
+		case "CREATE_TABLE":
+			db.tables[op.TableName] = &Table{
+				Name:    op.TableName,
+				Columns: op.Columns,
+				Rows:    make(map[string]Row),
 			}
-		case "DELETE":
-			delete(s.items, op.Key)
+
+		case "INSERT_ROW":
+			table, exists := db.tables[op.TableName]
+			if exists {
+				table.Rows[op.RowID] = op.RowData
+			}
+
+		case "DELETE_ROW":
+			table, exists := db.tables[op.TableName]
+			if exists {
+				delete(table.Rows, op.RowID)
+			}
+
+		case "DELETE_TABLE":
+			delete(db.tables, op.TableName)
 		}
-		s.lastOpNumber = op.OpNumber
+
+		db.lastOpNumber = op.OpNumber
 	}
 	return nil
+}
+
+func (db *Database) snapshotWorker() {
+	for range db.snapshotChan {
+		err := db.createSnapshot()
+
+		if err != nil {
+			fmt.Println(err)
+		}
+	}
 }
 
 func main() {
@@ -220,69 +406,120 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer wal.Close()
-	store = Store{
-		items:   make(map[string]Item),
-		walFile: wal,
+	db = Database{
+		tables:       make(map[string]*Table),
+		walFile:      wal,
+		snapshotChan: make(chan struct{}, 1),
 	}
-	err = store.loadSnapshot()
+	err = db.loadSnapshot()
 	if err != nil {
 		panic(err)
 	}
-	err = store.loadWAL()
+	err = db.loadWAL()
 	if err != nil {
 		panic(err)
 	}
+	go db.snapshotWorker()
 	r := chi.NewRouter()
-	r.Get("/items", getAllItems)
-	r.Get("/items/{key}", getItem)
-	r.Put("/items/{key}", putItem)
-	r.Delete("/items/{key}", deleteItem)
+	r.Post("/tables/{name}", createTable)
+	r.Post("/tables/{tableName}/rows/{rowId}", insertRow)
+	r.Delete("/tables/{name}", deleteTable)
+	r.Delete("/tables/{tableName}/row/{rowId}", deleteRow)
+	r.Get("/tables", getTables)
+	r.Get("/tables/{tableName}", getTable)
+	r.Get("/tables/{tableName}/rows/{rowId}", getRow)
 	fmt.Println("Server running on :8080")
-	http.ListenAndServe(":8080", r)
-}
-
-func getAllItems(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(store.getAll())
-}
-
-func getItem(w http.ResponseWriter, r *http.Request) {
-	key := chi.URLParam(r, "key")
-	item, exists := store.getItem(key)
-	if !exists {
-		http.Error(w, "item not found", 404)
-		return
+	err = http.ListenAndServe(":8080", r)
+	if err != nil {
+		panic(err)
 	}
-	json.NewEncoder(w).Encode(item)
 }
 
-func putItem(w http.ResponseWriter, r *http.Request) {
-	key := chi.URLParam(r, "key")
-	var item Item
-	err := json.NewDecoder(r.Body).Decode(&item)
+func createTable(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	var req CreateTableRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		http.Error(w, "invalid json", 400)
 		return
 	}
-	err = store.putItem(&item, key)
+	table, err := db.createTable(name, req.Columns)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	json.NewEncoder(w).Encode(item)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(table)
 }
 
-func deleteItem(w http.ResponseWriter, r *http.Request) {
-	key := chi.URLParam(r, "key")
-	ok, err := store.deleteItem(key)
+func insertRow(w http.ResponseWriter, r *http.Request) {
+	tableName := chi.URLParam(r, "tableName")
+	rowID := chi.URLParam(r, "rowId")
+
+	var row Row
+
+	err := json.NewDecoder(r.Body).Decode(&row)
+	if err != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+
+	insertedRow, err := db.insertRow(tableName, rowID, row)
+
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(insertedRow)
+}
+
+func deleteTable(w http.ResponseWriter, r *http.Request) {
+	tableName := chi.URLParam(r, "name")
+	err := db.deleteTable(tableName)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if !ok {
-		http.Error(w, "item not found", 404)
+	w.Write([]byte("deleted table"))
+}
+
+func deleteRow(w http.ResponseWriter, r *http.Request) {
+	tableName := chi.URLParam(r, "tableName")
+	rowId := chi.URLParam(r, "rowId")
+	err := db.deleteRow(tableName, rowId)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
 		return
 	}
-	w.Write([]byte("deleted"))
+	w.Write([]byte("deleted row"))
+}
+
+func getTables(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var result []Table
+	result = db.getTables()
+	json.NewEncoder(w).Encode(result)
+}
+
+func getTable(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	tableName := chi.URLParam(r, "tableName")
+	table, err := db.getTable(tableName)
+	if err != nil {
+		http.Error(w, err.Error(), 404)
+	}
+	json.NewEncoder(w).Encode(table)
+}
+
+func getRow(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	tableName := chi.URLParam(r, "tableName")
+	rowId := chi.URLParam(r, "rowId")
+	row, err := db.getRow(tableName, rowId)
+	if err != nil {
+		http.Error(w, err.Error(), 404)
+	}
+	json.NewEncoder(w).Encode(row)
 }
